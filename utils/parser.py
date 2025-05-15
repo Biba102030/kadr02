@@ -4,7 +4,8 @@ from datetime import datetime, timedelta
 import time
 from utils.storage import load_cache, save_cache
 
-async def fetch_articles_from_site(query=None, lang="ru", limit=5):
+async def fetch_articles_from_site(query=None, lang="ru", limit=10):
+    """Получение списка статей с сайта Kadrovik.uz"""
     start_time = time.time()
     base_url = "https://kadrovik.uz/" if lang == "ru" else "https://kadrovik.uz/uz/"
     url = base_url if not query else f"{base_url}search?q={query}"
@@ -15,13 +16,12 @@ async def fetch_articles_from_site(query=None, lang="ru", limit=5):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as response:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as response:
                 response.raise_for_status()
                 text = await response.text()
                 soup = BeautifulSoup(text, "html.parser")
 
         articles = []
-        # Парсинг секции "Новые публикации"
         posts_section = soup.select_one("section.posts-block ul.posts-list")
         if posts_section:
             for item in posts_section.select("li.post-card-wrapper")[:limit]:
@@ -32,12 +32,12 @@ async def fetch_articles_from_site(query=None, lang="ru", limit=5):
                     title_text = title.text.strip() if title else "Без заголовка"
                     date_text = date_elem["datetime"] if date_elem else datetime.now().isoformat()
                     link = article_link["href"]
-                    # Преобразуем относительный URL в абсолютный
                     if not link.startswith("http"):
                         link = base_url.rstrip("/") + "/" + link.lstrip("/")
+                    
                     articles.append({
                         "title": title_text,
-                        "content": "",
+                        "content": "",  # Убираем вызов fetch_article_content
                         "date": date_text,
                         "emoji": "📰",
                         "url": link
@@ -47,7 +47,7 @@ async def fetch_articles_from_site(query=None, lang="ru", limit=5):
             print(f"{datetime.now()}: Не удалось найти статьи по URL: {url}")
         print(f"{datetime.now()}: Парсинг завершен. Время: {time.time() - start_time:.2f} сек. Найдено статей: {len(articles)}")
         
-        # Сохранение в кэш
+        # Сохраняем в кэш
         cache = load_cache()
         cache_key = f"latest_{lang}" if not query else f"search_{query}_{lang}"
         cache[cache_key] = {
@@ -58,15 +58,62 @@ async def fetch_articles_from_site(query=None, lang="ru", limit=5):
         return articles
     except Exception as e:
         print(f"{datetime.now()}: Ошибка при парсинге сайта: {e}. Время: {time.time() - start_time:.2f} сек")
-        # Возвращаем кэшированные данные, если парсинг не удался
         cache = load_cache()
         cache_key = f"latest_{lang}" if not query else f"search_{query}_{lang}"
         return cache.get(cache_key, {}).get("data", [])
 
+async def fetch_article_content(url):
+    """Парсер с правильными переносами строк после emoji и абзацев"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=10) as response:
+                response.raise_for_status()
+                html = await response.text()
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # 1. Заголовок и дата (без #)
+        title = soup.find('h1').get_text(strip=True) if soup.find('h1') else "Без заголовка"
+        date_elem = soup.find('time', {'class': 'longread-post__time-published'})
+        date = date_elem['datetime'] if date_elem else ""
+        
+        # 2. Ищем контейнер с контентом
+        content_block = soup.find('section', {'class': 'longread-block'}) or soup.find('body')
+        
+        if not content_block:
+            return f"📰 {title}\n📅 {date}\n\nНе удалось найти контент."
+        
+        # 3. Собираем только <p> и <strong>
+        elements = content_block.find_all(['p', 'strong'])
+        result = [f"📰 {title}", f"📅 {date}"]
+        
+        for element in elements:
+            text = element.get_text(' ', strip=True)
+            if text:
+                if element.name == 'strong':
+                    result.append(f"\n🔹 {text}\n")  # Новый абзац для 🔹
+                else:
+                    result.append(f"\n{text}")       # Новый абзац для обычного текста
+        
+        # 4. Объединяем и удаляем дубликаты
+        content = ''.join(dict.fromkeys(result))
+        
+        return content if len(content) > 50 else "Не удалось извлечь текст."
+    
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return None
+
 async def search_articles(query, lang):
+    """Поиск статей по запросу"""
     cache = load_cache()
     cache_key = f"search_{query}_{lang}"
     
+    # Проверяем кэш
     if cache_key in cache:
         entry = cache[cache_key]
         timestamp = entry.get("timestamp")
@@ -79,9 +126,11 @@ async def search_articles(query, lang):
     return articles
 
 async def get_latest_articles(lang):
+    """Получение последних статей"""
     cache = load_cache()
     cache_key = f"latest_{lang}"
     
+    # Проверяем кэш
     if cache_key in cache:
         entry = cache[cache_key]
         timestamp = entry.get("timestamp")
